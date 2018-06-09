@@ -45,7 +45,8 @@ CREATE TABLE certificates(
     excluded_ip_addresses       varchar[] NOT NULL DEFAULT '{}',
     is_technically_constrained  bool NOT NULL DEFAULT false,
     cisco_umbrella_rank         integer NOT NULL DEFAULT 2147483647,
-    mozillaPolicyV2_5           jsonb NULL
+    mozillaPolicyV2_5           jsonb NULL,
+    zlint_failures              jsonb NULL,
 );
 CREATE INDEX certificates_sha256_fingerprint_idx ON certificates(sha256_fingerprint);
 CREATE INDEX certificates_subject_idx ON certificates(subject);

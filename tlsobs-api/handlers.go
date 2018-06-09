@@ -1,7 +1,8 @@
 package main
 
 import (
-	"crypto/x509"
+	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
@@ -14,11 +15,12 @@ import (
 	"strconv"
 	"time"
 
-	"bytes"
-	"crypto/sha256"
-
 	"github.com/mozilla/tls-observatory/certificate"
 	pg "github.com/mozilla/tls-observatory/database"
+
+	z509 "github.com/zmap/zcrypto/x509"
+	"github.com/zmap/zlint"
+	"github.com/zmap/zlint/lints"
 )
 
 var scanRefreshRate float64
@@ -254,15 +256,27 @@ func PostCertificateHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	certX509, err := x509.ParseCertificate(block.Bytes)
+	zcert, err := z509.ParseCertificate(block.Bytes)
 	if err != nil {
 		httpError(w, r, http.StatusBadRequest,
 			fmt.Sprintf("Could not parse X.509 certificate: %v", err))
 		return
 	}
 
-	certHash := certificate.SHA256Hash(certX509.Raw)
-	id, err := db.GetCertIDBySHA256Fingerprint(certHash)
+	results := zlint.LintCertificate(zcert)
+	if results == nil {
+		// bad
+		return
+	}
+
+	cert, err := certificate.FromZCrypto(zcert)
+	if err != nil {
+		httpError(w, r, http.StatusInternalServerError,
+			fmt.Sprintf("Error converting to mozilla Certificate type: %v", err))
+		return
+	}
+
+	id, err := db.GetCertIDBySHA256Fingerprint(cert.Hashes.SHA256)
 	if err != nil {
 		httpError(w, r, http.StatusInternalServerError,
 			fmt.Sprintf("Failed to lookup certificate hash in database: %v", err))
@@ -275,9 +289,13 @@ func PostCertificateHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var valInfo certificate.ValidationInfo
-	cert := certificate.CertToStored(certX509, certHash, "", "", "", &valInfo)
-	id, err = db.InsertCertificate(&cert)
+	// Run zlint over certificate now that we know it's new
+	cert.ZlintFailures = gatherFailingLints(results)
+
+	// cert := certificate.CertToStored(certX509, certHash, "", "", "", &valInfo)
+	cert.ValidationInfo = make(map[string]certificate.ValidationInfo)
+
+	id, err = db.InsertCertificate(cert)
 	if err != nil {
 		httpError(w, r, http.StatusInternalServerError,
 			fmt.Sprintf("Failed to store certificate in database: %v", err))
@@ -292,7 +310,7 @@ func PostCertificateHandler(w http.ResponseWriter, r *http.Request) {
 
 	// to insert the trust, first build the certificate paths, then insert one trust
 	// entry for each known parent of the cert
-	paths, err := db.GetCertPaths(&cert)
+	paths, err := db.GetCertPaths(cert)
 	if err != nil {
 		httpError(w, r, http.StatusInternalServerError,
 			fmt.Sprintf("Failed to retrieve chains from database: %v", err))
@@ -300,7 +318,7 @@ func PostCertificateHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	for _, parent := range paths.Parents {
 		cert.ValidationInfo = parent.GetValidityMap()
-		_, err := db.InsertTrustToDB(cert, cert.ID, parent.Cert.ID)
+		_, err := db.InsertTrustToDB(*cert, cert.ID, parent.Cert.ID)
 		if err != nil {
 			httpError(w, r, http.StatusInternalServerError,
 				fmt.Sprintf("Failed to store trust in database: %v", err))
@@ -310,6 +328,22 @@ func PostCertificateHandler(w http.ResponseWriter, r *http.Request) {
 
 	jsonCertFromID(w, r, cert.ID)
 	return
+}
+
+// gatherFailingLints takes results from a zlint pass and collects only the
+// failing error and fatal lints.
+func gatherFailingLints(rs *zlint.ResultSet) []string {
+	if !rs.ErrorsPresent && !rs.FatalsPresent {
+		return nil
+	}
+
+	var out []string
+	for name, res := range rs.Results {
+		if res.Status == lints.Error || res.Status == lints.Fatal {
+			out = append(out, fmt.Sprintf("%s: %s", name, res.Details))
+		}
+	}
+	return out
 }
 
 // PathsHandler handles the /paths endpoint of the api.

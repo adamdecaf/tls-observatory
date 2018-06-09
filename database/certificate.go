@@ -132,10 +132,11 @@ func (db *DB) InsertCertificate(cert *certificate.Certificate) (int64, error) {
                                        excluded_ip_addresses,
                                        is_technically_constrained,
                                        cisco_umbrella_rank,
-                                       mozillaPolicyV2_5
+                                       mozillaPolicyV2_5,
+                                       zlint_failures
                                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
                                         $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27,
-                                        $28, $29, $30, $31, $32, $33, $34, $35)
+                                        $28, $29, $30, $31, $32, $33, $34, $35, $36)
                                         RETURNING id`,
 		cert.Serial,
 		cert.Hashes.SHA1,
@@ -172,6 +173,7 @@ func (db *DB) InsertCertificate(cert *certificate.Certificate) (int64, error) {
 		cert.X509v3Extensions.IsTechnicallyConstrained,
 		cert.CiscoUmbrellaRank,
 		mozPolicy,
+		cert.ZlintFailures,
 	).Scan(&id)
 	if err != nil {
 		return -1, err
@@ -340,7 +342,6 @@ func (db *DB) UpdateCertificate(cert *certificate.Certificate) error {
 		cert.X509v3Extensions.IsTechnicallyConstrained,
 		cert.CiscoUmbrellaRank,
 		mozPolicy,
-
 		cert.ID,
 	)
 	return err

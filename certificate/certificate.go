@@ -12,12 +12,15 @@ import (
 	"encoding/base64"
 	"fmt"
 	"log"
+	"math/big"
 	"net"
 	"strconv"
 	"strings"
 	"time"
 
 	certconstraints "github.com/mozilla/tls-observatory/certificate/constraints"
+
+	zcrypto "github.com/zmap/zcrypto/x509"
 )
 
 const (
@@ -54,6 +57,7 @@ type Certificate struct {
 	CiscoUmbrellaRank      int64                     `json:"ciscoUmbrellaRank"`
 	Anomalies              string                    `json:"anomalies,omitempty"`
 	MozillaPolicyV2_5      MozillaPolicy             `json:"mozillaPolicyV2_5"`
+	ZlintFailures          []string                  `json:"zlintFailures"`
 }
 
 type MozillaPolicy struct {
@@ -213,21 +217,33 @@ var PublicKeyAlgorithm = [...]string{
 }
 
 func SubjectSPKISHA256(cert *x509.Certificate) string {
+	return subjectSPKISHA256(cert.RawSubject, cert.RawSubjectPublicKeyInfo)
+}
+
+func subjectSPKISHA256(sub, spki []byte) string {
 	h := sha256.New()
-	h.Write(cert.RawSubject)
-	h.Write(cert.RawSubjectPublicKeyInfo)
+	h.Write(sub)
+	h.Write(spki)
 	return fmt.Sprintf("%X", h.Sum(nil))
 }
 
 func SPKISHA256(cert *x509.Certificate) string {
+	return spkiSHA256(cert.RawSubjectPublicKeyInfo)
+}
+
+func spkiSHA256(spki []byte) string {
 	h := sha256.New()
-	h.Write(cert.RawSubjectPublicKeyInfo)
+	h.Write(spki)
 	return fmt.Sprintf("%X", h.Sum(nil))
 }
 
 func PKPSHA256Hash(cert *x509.Certificate) string {
+	return pkpSHA256Hash(cert.PublicKey)
+}
+
+func pkpSHA256Hash(pubKey interface{}) string {
 	h := sha256.New()
-	switch pub := cert.PublicKey.(type) {
+	switch pub := pubKey.(type) {
 	case *rsa.PublicKey, *dsa.PublicKey, *ecdsa.PublicKey:
 		der, _ := x509.MarshalPKIXPublicKey(pub)
 		h.Write(der)
@@ -436,12 +452,17 @@ func getMozillaPolicyV2_5(cert *x509.Certificate) MozillaPolicy {
 	return MozillaPolicy{IsTechnicallyConstrained: certconstraints.IsTechnicallyConstrainedMozPolicyV2_5(cert)}
 }
 
-func getPublicKeyInfo(cert *x509.Certificate) (SubjectPublicKeyInfo, error) {
-	pubInfo := SubjectPublicKeyInfo{
-		Alg: PublicKeyAlgorithm[cert.PublicKeyAlgorithm],
+func getPublicKeyInfo(algo interface{}, pubKey interface{}) (SubjectPublicKeyInfo, error) {
+	pubInfo := SubjectPublicKeyInfo{}
+
+	switch a := algo.(type) {
+	case x509.PublicKeyAlgorithm:
+		pubInfo.Alg = PublicKeyAlgorithm[a]
+	case zcrypto.PublicKeyAlgorithm:
+		pubInfo.Alg = PublicKeyAlgorithm[a]
 	}
 
-	switch pub := cert.PublicKey.(type) {
+	switch pub := pubKey.(type) {
 	case *rsa.PublicKey:
 		pubInfo.Size = float64(pub.N.BitLen())
 		pubInfo.Exponent = float64(pub.E)
@@ -492,7 +513,11 @@ func getPublicKeyInfo(cert *x509.Certificate) (SubjectPublicKeyInfo, error) {
 }
 
 func GetHexASN1Serial(cert *x509.Certificate) (serial string, err error) {
-	m, err := asn1.Marshal(cert.SerialNumber)
+	return getHexASN1Serial(cert.SerialNumber)
+}
+
+func getHexASN1Serial(n *big.Int) (serial string, err error) {
+	m, err := asn1.Marshal(n)
 	if err != nil {
 		return
 	}
@@ -523,9 +548,9 @@ func CertToStored(cert *x509.Certificate, parentSignature, domain, ip string, TS
 
 	stored.SignatureAlgorithm = SignatureAlgorithm[cert.SignatureAlgorithm]
 
-	stored.Key, err = getPublicKeyInfo(cert)
+	stored.Key, err = getPublicKeyInfo(cert.PublicKeyAlgorithm, cert.PublicKey)
 	if err != nil {
-		log.Printf("Failed to retrieve public key information: %v. Continuing anyway.", err)
+		log.Printf("CertToStored: Failed to retrieve public key information: %v. Continuing anyway.", err)
 	}
 
 	stored.Issuer.Country = cert.Issuer.Country
@@ -595,7 +620,90 @@ func (cert Certificate) ToX509() (xcert *x509.Certificate, err error) {
 	if err != nil {
 		return
 	}
-	return x509.ParseCertificate(certRaw)
+	return x509.ParseCertificate(certRaw) // TODO(Adam): ???
+}
+
+// FromZCrypto accepts a certificate from the zcrypto library and converts it to a
+// Certificate struct suitable for storage.
+func FromZCrypto(z *zcrypto.Certificate) (cert *Certificate, err error) {
+	// initialize []string to never store them as null
+	cert.ParentSignature = make([]string, 0)
+	cert.IPs = make([]string, 0)
+
+	cert.Version = z.Version
+
+	// store zero if we run into an error
+	serial, _ := getHexASN1Serial(z.SerialNumber)
+	cert.Serial = serial
+
+	cert.SignatureAlgorithm = SignatureAlgorithm[z.SignatureAlgorithm]
+
+	cert.Key, err = getPublicKeyInfo(z.PublicKeyAlgorithm, z.PublicKey)
+	if err != nil {
+		log.Printf("FromZCrypto: Failed to retrieve public key information: %v. Continuing anyway.", err)
+	}
+
+	cert.Issuer.Country = z.Issuer.Country
+	cert.Issuer.Organisation = z.Issuer.Organization
+	cert.Issuer.OrgUnit = z.Issuer.OrganizationalUnit
+	cert.Issuer.CommonName = z.Issuer.CommonName
+
+	cert.Subject.Country = z.Subject.Country
+	cert.Subject.Organisation = z.Subject.Organization
+	cert.Subject.OrgUnit = z.Subject.OrganizationalUnit
+	cert.Subject.CommonName = z.Subject.CommonName
+
+	cert.Validity.NotBefore = z.NotBefore.UTC()
+	cert.Validity.NotAfter = z.NotAfter.UTC()
+
+	// stored.X509v3Extensions = getCertExtensions(cert) // TODO(adam)
+
+	// stored.MozillaPolicyV2_5 = getMozillaPolicyV2_5(cert) // TODO(adam)
+
+	// TODO(adam): ??? uhh ???
+	// //below check tries to hack around the basic constraints extension
+	// //not being available in versions < 3.
+	// //Only the IsCa variable is set, as setting X509v3BasicConstraints
+	// //messes up the validation procedure.
+	// if cert.Version < 3 {
+	// 	stored.CA = cert.IsCA
+	// } else {
+	// 	if cert.BasicConstraintsValid {
+	// 		stored.X509v3BasicConstraints = "Critical"
+	// 		stored.CA = cert.IsCA
+	// 	} else {
+	// 		stored.X509v3BasicConstraints = ""
+	// 		stored.CA = false
+	// 	}
+	// }
+
+	t := time.Now().UTC()
+	cert.FirstSeenTimestamp = t
+	cert.LastSeenTimestamp = t
+
+	// TOOD(adam): uhh??
+	// cert.ParentSignature = append(cert.ParentSignature, parentSignature)
+
+	// TODO(adam): uhh??
+	// if !cert.IsCA {
+	// 	stored.ScanTarget = domain
+	// 	stored.IPs = append(stored.IPs, ip)
+	// }
+
+	// cert.ValidationInfo = make(map[string]ValidationInfo)
+	// cert.ValidationInfo[TSName] = *valInfo
+
+	cert.Hashes.MD5 = MD5Hash(z.Raw)
+	cert.Hashes.SHA1 = SHA1Hash(z.Raw)
+	cert.Hashes.SHA256 = SHA256Hash(z.Raw)
+	cert.Hashes.SPKISHA256 = spkiSHA256(z.RawSubjectPublicKeyInfo)
+	cert.Hashes.SubjectSPKISHA256 = subjectSPKISHA256(z.RawSubject, z.RawSubjectPublicKeyInfo)
+	cert.Hashes.PKPSHA256 = pkpSHA256Hash(z.PublicKey)
+
+	cert.Raw = base64.StdEncoding.EncodeToString(z.Raw)
+	cert.CiscoUmbrellaRank = Default_Cisco_Umbrella_Rank
+
+	return cert, nil
 }
 
 //printRawCertExtensions Print raw extension info
